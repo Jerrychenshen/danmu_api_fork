@@ -57,6 +57,11 @@ class SyncTest(unittest.TestCase):
         self.git('checkout', '-q', 'main')
         return tip
 
+    def assert_update_parents(self, commit, tip):
+        self.assertEqual(self.git('show', '-s', '--format=%P', commit), self.head + ' ' + tip)
+        self.git('merge-base', '--is-ancestor', self.head, commit)
+        self.git('merge-base', '--is-ancestor', tip, commit)
+
     def test_noop_idempotent_no_commit_no_worktree_change(self):
         first = sync.plan('upstream')
         self.assertEqual(first, sync.plan('upstream'))
@@ -77,6 +82,7 @@ class SyncTest(unittest.TestCase):
         saved = sync.plan(tip)
         self.assertTrue(saved['source_changed'])
         commit = sync.finalize(saved)
+        self.assert_update_parents(commit, tip)
         self.assertEqual(self.git('show', commit + ':app.js'), 'new upstream')
         self.assertNotIn('delete.js', sync.entries(commit))
         self.assertIn('added.js', sync.entries(commit))
@@ -97,7 +103,9 @@ class SyncTest(unittest.TestCase):
         self.git('read-tree', '--reset', '-u', commit)
         self.git('update-ref', 'refs/heads/main', commit)
         self.git('update-ref', 'refs/remotes/origin/main', commit)
-        self.assertEqual(sync.plan(tip)['mode'], 'noop')
+        next_plan = sync.plan(tip)
+        self.assertEqual(next_plan['mode'], 'noop')
+        self.assertEqual(sync.finalize(next_plan), '')
 
     def test_customization_is_rejected_even_without_upstream_update(self):
         self.write('app.js', 'owner custom edit\n')
@@ -141,6 +149,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(saved['mode'], 'verify')
         commit = sync.finalize(saved)
         self.assertEqual(self.git('rev-parse', commit + '^{tree}'), self.git('rev-parse', 'HEAD^{tree}'))
+        self.assertEqual(self.git('show', '-s', '--format=%P', commit), self.head)
         self.assertIn('No application source changes', self.git('show', '-s', '--format=%B', commit))
 
     def test_controls_only_upstream_update_advances_state_without_npm(self):
@@ -148,7 +157,40 @@ class SyncTest(unittest.TestCase):
         saved = sync.plan(tip)
         self.assertEqual(saved['mode'], 'update')
         self.assertFalse(saved['source_changed'])
-        self.assertEqual(sync.read_json(sync.finalize(saved), sync.STATE)['upstream_sha'], tip)
+        commit = sync.finalize(saved)
+        self.assert_update_parents(commit, tip)
+        self.assertEqual(sync.read_json(commit, sync.STATE)['upstream_sha'], tip)
+        self.assertEqual({p: v for p, v in sync.entries(commit).items() if p != sync.STATE},
+                         {p: v for p, v in sync.entries(self.head).items() if p != sync.STATE})
+
+    def test_already_merged_upstream_has_no_redundant_parent(self):
+        tip = self.upstream_change(lambda: self.write('.github/extra.yml', 'excluded'))
+        # Model a guarded merge whose state still records the older upstream tip.
+        self.head = self.git('commit-tree', self.head + '^{tree}',
+                             '-p', self.head, '-p', tip, '-m', 'already merged')
+        self.git('update-ref', 'refs/heads/main', self.head)
+        self.git('update-ref', 'refs/remotes/origin/main', self.head)
+        saved = sync.plan(tip)
+        self.assertEqual(saved['mode'], 'update')
+        commit = sync.finalize(saved)
+        self.assertEqual(self.git('show', '-s', '--format=%P', commit), self.head)
+        self.git('merge-base', '--is-ancestor', tip, commit)
+        self.assertEqual(sync.read_json(commit, sync.STATE)['upstream_sha'], tip)
+
+    def test_existing_protected_content_survives_merge(self):
+        self.write('.pr_agent.toml', 'owner config\n')
+        self.head = self.commit('owner protected content')
+        self.git('update-ref', 'refs/remotes/origin/main', self.head)
+        def mutate():
+            self.write('app.js', 'updated\n')
+            self.write('.pr_agent.toml', 'untrusted config\n')
+            self.write('.github/workflows/sync-upstream.yml', 'untrusted workflow\n')
+        tip = self.upstream_change(mutate)
+        commit = sync.finalize(sync.plan(tip))
+        self.assert_update_parents(commit, tip)
+        for path, value in sync.entries(self.head).items():
+            if sync.protected(path) and path != sync.STATE:
+                self.assertEqual(sync.entries(commit)[path], value)
 
     def test_tampered_plan_is_rejected(self):
         saved = sync.plan('upstream', True)

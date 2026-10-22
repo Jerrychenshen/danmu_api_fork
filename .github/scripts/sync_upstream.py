@@ -119,7 +119,12 @@ def finalize(saved):
                    f"Upstream: {UPSTREAM}/commit/{saved['upstream']}\n"
                    'Snapshot retains upstream source attribution and license.\n'
                    'Automated on behalf of repository owner Jerrychenshen.\n')
-    return git('commit-tree', saved['tree'], '-p', saved['head'],
+    parents = ['-p', saved['head']]
+    # Preserve genuine public upstream ancestry without adding a redundant parent.
+    if saved['mode'] == 'update' and git(
+            'rev-list', '--max-count=1', saved['head'] + '..' + saved['upstream']).strip():
+        parents.extend(['-p', saved['upstream']])
+    return git('commit-tree', saved['tree'], *parents,
                data=message.encode(), env=OWNER_ENV).decode().strip()
 
 

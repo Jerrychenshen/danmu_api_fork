@@ -11,7 +11,7 @@
 
 从当前远程 main 检出完整历史；工作目录必须完全干净，HEAD 必须等于检出的 origin/main。只从 `https://github.com/huangxd-/danmu_api.git` 的 main 获取上游；状态中的上次 SHA 必须仍是新上游的祖先。源文件按 Git 对象、模式和路径精确比较，包含删除和可执行位；拒绝子模块。若当前业务源树偏离上次上游，立即停止，交给人工合并。
 
-`.github/` 整体以及 `.pr_agent.toml` 保持本地版本，包括原有删除状态。新上游的工作流不会导入。正常同步后的其他文件精确等于新上游。上游 SHA 写入 `.github/upstream-sync.json` 并保留在提交消息及链接中；保留源文件中的署名、许可证。
+`.github/` 整体以及 `.pr_agent.toml` 保持本地版本，包括原有删除状态。新上游的工作流不会导入。正常同步后的其他文件精确等于新上游。更新提交以当前 main 为第一父节点、实际通过检查的公开上游 tip 为第二父节点，保留真实上游合并祖先关系；若 tip 已是 main 的祖先则不添加冗余父节点。提交树仍按上述源文件与受保护控制文件规则独立构造，不导入上游控制文件。显式空验证提交只有当前 main 一个父节点，无更新则不创建提交。上游 SHA 写入 `.github/upstream-sync.json` 并保留在提交消息及链接中；保留源文件中的署名、许可证。
 
 上游修改任意位置的 `vercel.json` / `vercel.ts` / `vercel.js`、`.vercelignore`、`.vercel/`、`.nvmrc`、`.node-version`、`.npmrc`、`Dockerfile` 时停止。package.json 的 engines、type、main、packageManager、os、cpu、volta 或 start/build/vercel-build/test 命令变化也停止。依赖版本变化允许进入 npm 测试。这些是明确的静态迁移检查，无法证明任意业务代码不存在语义上的运行时迁移；测试结果仍需结合真实 Vercel 构建判断。
 
