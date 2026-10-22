@@ -1,0 +1,101 @@
+name: Bounded upstream sync
+
+on:
+  schedule:
+    - cron: '17 20 * * *'
+  workflow_dispatch:
+    inputs:
+      verify_deploy:
+        description: 'Create one empty owner commit if upstream is unchanged (Vercel verification)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bounded-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Jerrychenshen/danmu_api_fork' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test sync controls
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Plan bounded snapshot
+        id: plan
+        env:
+          VERIFY_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_deploy || false }}
+        run: |
+          args=()
+          if [[ "$VERIFY_DEPLOY" == true ]]; then args+=(--verify); fi
+          python3 -B .github/scripts/sync_upstream.py prepare --plan "$RUNNER_TEMP/sync-plan.json" "${args[@]}"
+      - name: Set up Vercel Node runtime
+        if: steps.plan.outputs.source_changed == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+          token: ''
+      - name: Test candidate source in separate directory
+        if: steps.plan.outputs.source_changed == 'true'
+        env:
+          CANDIDATE_TREE: ${{ steps.plan.outputs.tree }}
+        run: |
+          mkdir "$RUNNER_TEMP/upstream-source"
+          git archive "$CANDIDATE_TREE" | tar -x -C "$RUNNER_TEMP/upstream-source"
+          cd "$RUNNER_TEMP/upstream-source"
+          npm install --no-audit --no-fund
+          npm test
+      - name: Create owner commit from validated tree
+        if: steps.plan.outputs.mode != 'noop'
+        id: commit
+        run: python3 -B .github/scripts/sync_upstream.py finalize --plan "$RUNNER_TEMP/sync-plan.json"
+      - name: Push only if remote main still matches the plan
+        if: steps.plan.outputs.mode != 'noop'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ steps.plan.outputs.head }}
+          SYNC_COMMIT: ${{ steps.commit.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Process environment only: never persist credentials in .git/config.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_KEY_1=core.hooksPath
+          export GIT_CONFIG_VALUE_1=/dev/null
+          remote=https://github.com/Jerrychenshen/danmu_api_fork.git
+          actual=$(git ls-remote "$remote" refs/heads/main | cut -f1)
+          if [[ "$actual" != "$EXPECTED_HEAD" ]]; then
+            echo '::error::Remote main changed concurrently; refusing push. Rerun from current main.'
+            exit 1
+          fi
+          git push "$remote" "$SYNC_COMMIT:refs/heads/main"
+      - name: Native run summary
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          MODE: ${{ steps.plan.outputs.mode }}
+          UPSTREAM_SHA: ${{ steps.plan.outputs.upstream }}
+          SYNC_COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          {
+            echo "Result: $RESULT"
+            echo "Mode: ${MODE:-planning failed} (noop = no install or push; update = upstream snapshot; verify = empty owner commit)"
+            echo "Upstream SHA: $UPSTREAM_SHA"
+            echo "Created commit: $SYNC_COMMIT"
+            echo 'A successful push does not prove deployment. Inspect the existing Vercel Git integration and deployment author/build.'
+            echo 'If GITHUB_TOKEN pushes do not trigger Vercel, stop and report the blocker. Do not add PATs, deploy hooks, or Vercel credentials.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$RESULT" != success ]]; then echo '::error::Sync failed; inspect the failing step. Deployment success is unverified.'; fi
